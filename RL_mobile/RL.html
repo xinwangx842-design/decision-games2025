@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,user-scalable=no"/>
+<title>Prosocial RL – Mobile</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
+  #bar{position:fixed;top:0;left:0;right:0;height:48px;display:flex;align-items:center;gap:8px;padding:0 10px;background:#f7f7f7;border-bottom:1px solid #ddd;z-index:10}
+  #bar input{height:30px;padding:0 8px;border:1px solid #ccc;border-radius:6px}
+  #bar button{height:30px;padding:0 12px;border:0;border-radius:6px;background:#1976d2;color:#fff}
+  #quit{margin-left:auto;background:#c62828}
+  #stage{display:block;margin:48px auto 0 auto;background:#fff;touch-action:manipulation}
+  #hint{position:fixed;bottom:8px;left:0;right:0;text-align:center;color:#777;font-size:12px}
+</style>
+</head>
+<body>
+<div id="bar">
+  被试ID：<input id="pid" value="S001"/>
+  种子：<input id="seed" placeholder="留空随机"/>
+  <button id="start">开始</button>
+  <button id="quit">退出</button>
+</div>
+<canvas id="stage"></canvas>
+<div id="hint">提示：若看不到图片，请用我们提供的 https 链接打开；本地 file:// 在手机上无法加载资源。</div>
+
+<script>
+/* ===== 参数（可调） ===== */
+const TRIALS_PER_BLOCK = 3;      // 正式可改 16
+const P_HIGH = 0.75, P_LOW = 0.25;
+const RT_LIMIT = 5000;           // 5s（毫秒）
+const HILIGHT_TIME = 1500;       // 1.5s
+const FBK_TIME = 800;            // 0.8s
+
+const TEXT_COLOR = "#000";
+const COLOR_SELF  = "#1867ff";
+const COLOR_OTHER = "#2e7d32";
+const COLOR_NONE  = "#616161";
+
+/* ===== 条件与图片对 ===== */
+// Self: (1,2),(3,4),(5,6)   → state 1..3
+// Other:(7,8),(9,10),(11,12)→ state 4..6
+// NoOne:(13,14),(15,16),(17,18)→ state 7..9
+const CONDITIONS = [
+  {name:'self',  label:'YOU',   color:COLOR_SELF,  recipient_num:1, baseState:1,  pairs:[['image1','image2'],['image3','image4'],['image5','image6']]},
+  {name:'other', label:'OTHER', color:COLOR_OTHER, recipient_num:2, baseState:4,  pairs:[['image7','image8'],['image9','image10'],['image11','image12']]},
+  {name:'noone', label:'NO ONE',color:COLOR_NONE,  recipient_num:3, baseState:7,  pairs:[['image13','image14'],['image15','image16'],['image17','image18']]}
+];
+
+function rndShuffle(a){for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
+function isHighFromName(name){const m=name.match(/image(\d+)/);return m? (parseInt(m[1])%2===1) : null;}
+function imgPath(name){return `resources/${name}.png`;}
+
+/* ===== 画布与布局（竖屏优化） ===== */
+const canvas=document.getElementById('stage');
+const ctx=canvas.getContext('2d');
+
+function fitCanvas(){
+  // 竖屏优先：宽=窗口宽-16px， 高=窗口高-工具栏-16px
+  const W = Math.min(window.innerWidth, 720);
+  const H = Math.min(window.innerHeight-56, 1280);
+  canvas.width = W; canvas.height = H;
+}
+window.addEventListener('resize', fitCanvas); fitCanvas();
+
+const LAYOUT = {
+  labelY: ()=> canvas.height*0.15,
+  imgSize: ()=> Math.min(canvas.width, canvas.height)*0.35,  // 更大些
+  imgY: ()=> canvas.height*0.52,
+  leftX: ()=> canvas.width*0.27,
+  rightX: ()=> canvas.width*0.73,
+  promptY: ()=> canvas.height*0.90
+};
+
+/* ===== 状态 ===== */
+let PID="S001"; let rng=Math.random;
+let blocks=[], trialQueue=[], currentBlock=null, currentTrial=null;
+let phase='idle'; // intro | choice | highlight | feedback | rest | end
+let chooseStart=0, highlightStart=0, feedbackStart=0;
+let choiceSide=null, rt_ms=null, isHigh=false, action=0, reward=0;
+let logicIndex=0; let dataRows=[];
+
+/* ===== 图片缓存 ===== */
+const IMAGES={};
+function preloadImages(names){
+  return Promise.all(names.map(n=>new Promise(res=>{
+    const img=new Image(); img.onload=()=>res(); img.onerror=()=>res(); img.src=imgPath(n); IMAGES[n]=img;
+  })));
+}
+
+/* ===== 构造 9 个 block，尽量避免相邻同条件 ===== */
+function buildBlocks(){
+  const list=[];
+  for(const cond of CONDITIONS){
+    for(let i=0;i<3;i++){
+      const [A,B]=cond.pairs[i];
+      list.push({recipient:cond.name,label:cond.label,color:cond.color,recipient_num:cond.recipient_num,
+                 optionA_img:A, optionB_img:B, state:cond.baseState+i});
+    }
+  }
+  let tries=0;
+  while(tries<200){
+    rndShuffle(list);
+    let ok=true;
+    for(let i=1;i<list.length;i++){ if(list[i].recipient===list[i-1].recipient){ok=false;break;} }
+    if(ok) break; tries++;
+  }
+  return list;
+}
+
+/* ===== 绘制工具 ===== */
+function clear(){ctx.fillStyle="#fff"; ctx.fillRect(0,0,canvas.width,canvas.height);}
+function drawText(text,x,y,color=TEXT_COLOR,sizeRatio=0.045,bold=false){
+  ctx.fillStyle=color;
+  ctx.font = `${bold?'700 ':''}${Math.round(canvas.height*sizeRatio)}px system-ui,Arial`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(text,x,y);
+}
+function drawImage(name,x,y,size){
+  const img=IMAGES[name]; if(!img) return null;
+  const w=size, h=size, xx=x-w/2, yy=y-h/2;
+  ctx.drawImage(img, xx, yy, w, h);
+  return {x:xx, y:yy, w, h};
+}
+function drawRect(rect){ if(!rect) return; ctx.lineWidth=6; ctx.strokeStyle='red'; ctx.strokeRect(rect.x-6,rect.y-6,rect.w+12,rect.h+12); }
+function hit(x,y,r){ return r && x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+
+/* ===== 主流程 ===== */
+function startExp(){
+  PID = (document.getElementById('pid').value||'S001').trim();
+  const seed=(document.getElementById('seed').value||'').trim();
+  if(seed){ // 简单可复现实验：线性同余发生器
+    let s = Number(seed)%2147483647; if (s<=0) s+=2147483646;
+    rng = ()=> (s = s*16807 % 2147483647) / 2147483647;
+  }else{
+    rng = Math.random;
+  }
+  dataRows=[]; logicIndex=0;
+  blocks = buildBlocks();
+  currentBlock=null; trialQueue=[]; currentTrial=null;
+  phase='intro';
+  draw();
+}
+document.getElementById('start').addEventListener('click', startExp);
+document.getElementById('quit').addEventListener('click', endExp);
+
+/* click + touchstart 提高触控兼容 */
+function pointerXY(e){
+  const rect=canvas.getBoundingClientRect();
+  let x,y;
+  if (e.touches && e.touches[0]) { x=e.touches[0].clientX-rect.left; y=e.touches[0].clientY-rect.top; }
+  else { x=e.clientX-rect.left; y=e.clientY-rect.top; }
+  return {x,y};
+}
+canvas.addEventListener('click', onPointer, {passive:true});
+canvas.addEventListener('touchstart', onPointer, {passive:true});
+
+function onPointer(e){
+  const {x,y}=pointerXY(e);
+  if(phase==='intro'){
+    const names=[]; for(let i=1;i<=18;i++) names.push(`image${i}`);
+    preloadImages(names).then(()=>gotoNextBlock(true));
+  }else if(phase==='choice'){
+    const L=currentTrial.Lrect, R=currentTrial.Rrect;
+    if (hit(x,y,L)) onChoice('left');
+    else if (hit(x,y,R)) onChoice('right');
+  }else if(phase==='rest'){
+    gotoNextBlock(false);
+  }
+}
+
+/* 帧循环 */
+function draw(){
+  clear();
+  if(phase==='intro'){
+    drawText("任务说明", canvas.width*0.5, canvas.height*0.22, TEXT_COLOR, 0.06, true);
+    drawText("每次出现两张图片，请在 5 秒内点按更可能得分的一张。", canvas.width*0.5, canvas.height*0.36);
+    drawText("选择后先高亮 1.5 秒，随后出现反馈。", canvas.width*0.5, canvas.height*0.44);
+    drawText("区块之间图片会更换，需要重新学习以获取奖励。", canvas.width*0.5, canvas.height*0.52);
+    drawText("点按屏幕任意位置开始。", canvas.width*0.5, canvas.height*0.66, COLOR_SELF);
+  }
+  else if(phase==='choice'){
+    drawText(currentBlock.label, canvas.width*0.5, LAYOUT.labelY(), TEXT_COLOR, 0.05, true);
+    const size = LAYOUT.imgSize();
+    currentTrial.Lrect = drawImage(currentTrial.left_img,  LAYOUT.leftX(),  LAYOUT.imgY(), size);
+    currentTrial.Rrect = drawImage(currentTrial.right_img, LAYOUT.rightX(), LAYOUT.imgY(), size);
+    drawText("请点按左/右图片进行选择", canvas.width*0.5, LAYOUT.promptY(), TEXT_COLOR, 0.04);
+    if (performance.now()-chooseStart > RT_LIMIT){
+      // 未反应：重排
+      trialQueue.push(currentTrial);
+      nextFromChoice(); // 继续该块
+    }
+  }
+  else if(phase==='highlight'){
+    drawText(currentBlock.label, canvas.width*0.5, LAYOUT.labelY(), TEXT_COLOR, 0.05, true);
+    const size = LAYOUT.imgSize();
+    drawImage(currentTrial.left_img,  LAYOUT.leftX(),  LAYOUT.imgY(), size);
+    drawImage(currentTrial.right_img, LAYOUT.rightX(), LAYOUT.imgY(), size);
+    drawRect(choiceSide==='left'?currentTrial.Lrect:currentTrial.Rrect);
+    if (performance.now()-highlightStart > HILIGHT_TIME) {
+      phase='feedback'; feedbackStart=performance.now();
+    }
+  }
+  else if(phase==='feedback'){
+    const who = currentBlock.recipient==='self' ? '你' : (currentBlock.recipient==='other' ? '他人' : '无人');
+    const color = currentBlock.recipient==='self' ? COLOR_SELF : (currentBlock.recipient==='other'?COLOR_OTHER:COLOR_NONE);
+    drawText(`${who}获得 ${reward} 分`, canvas.width*0.5, canvas.height*0.5, color, 0.075, true);
+    if (performance.now()-feedbackStart > FBK_TIME){
+      nextTrialOrBlock();
+    }
+  }
+  else if(phase==='rest'){
+    drawText("图片已更换，需要重新学习以获取奖励。", canvas.width*0.5, canvas.height*0.45, TEXT_COLOR, 0.055, true);
+    drawText("点按屏幕继续。", canvas.width*0.5, canvas.height*0.6, COLOR_SELF, 0.05);
+  }
+  else if(phase==='end'){
+    drawText("任务结束，感谢参与！", canvas.width*0.5, canvas.height*0.5, TEXT_COLOR, 0.075, true);
+  }
+  requestAnimationFrame(draw);
+}
+
+/* 选择/流程 */
+function onChoice(side){
+  choiceSide=side;
+  rt_ms=performance.now()-chooseStart;
+  isHigh = side==='left' ? (currentTrial.left_is_high===1) : (currentTrial.right_is_high===1);
+  action = isHigh ? 1 : 0;
+  phase='highlight'; highlightStart=performance.now();
+}
+function nextFromChoice(){
+  if (trialQueue.length===0){ gotoNextBlock(false); }
+  else {
+    currentTrial = trialQueue.shift(); setupChoice(); phase='choice';
+  }
+}
+function nextTrialOrBlock(){
+  reward = (rng() < (isHigh?P_HIGH:P_LOW)) ? 1 : 0;
+  logicIndex += 1;
+  dataRows.push({
+    participant: PID,
+    recipient: currentBlock.recipient,
+    recipient_num: currentBlock.recipient_num,
+    state: currentTrial.state,
+    action: action,
+    reward: reward,
+    rt: (rt_ms/1000).toFixed(3),
+    logic_index: logicIndex,
+    choice_side: choiceSide,
+    left_is_high: currentTrial.left_is_high,
+    right_is_high: currentTrial.right_is_high,
+    optionA_img: currentBlock.optionA_img,
+    optionB_img: currentBlock.optionB_img
+  });
+  if (trialQueue.length>0){ currentTrial=trialQueue.shift(); setupChoice(); phase='choice'; }
+  else { phase = blocks.length>0 ? 'rest' : 'end'; if(phase==='end') downloadCSV(); }
+}
+function gotoNextBlock(isFirst){
+  if (blocks.length===0){ blocks = buildBlocks(); }
+  currentBlock = blocks.shift();
+  trialQueue=[];
+  for(let t=0;t<TRIALS_PER_BLOCK;t++){
+    const lr = (rng()<0.5);
+    const L = lr ? currentBlock.optionA_img : currentBlock.optionB_img;
+    const R = lr ? currentBlock.optionB_img : currentBlock.optionA_img;
+    trialQueue.push({
+      left_img:L, right_img:R,
+      left_is_high:isHighFromName(L)?1:0,
+      right_is_high:isHighFromName(R)?1:0,
+      state:currentBlock.state
+    });
+  }
+  currentTrial = trialQueue.shift();
+  setupChoice();
+  phase = isFirst ? 'choice' : 'rest';
+}
+function setupChoice(){ chooseStart=performance.now(); choiceSide=null; rt_ms=null; isHigh=false; action=0; reward=0; }
+
+/* 导出CSV */
+function downloadCSV(){
+  const headers=['participant','recipient','recipient_num','state','action','reward','rt','logic_index','choice_side','left_is_high','right_is_high','optionA_img','optionB_img'];
+  const lines=[headers.join(',')];
+  dataRows.forEach(r=>lines.push(headers.map(k=>r[k]??'').join(',')));
+  const blob=new Blob(["\ufeff"+lines.join("\n")],{type:"text/csv;charset=utf-8;"});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`RL_${PID}_${Date.now()}.csv`; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+function endExp(){ downloadCSV(); phase='end'; }
+</script>
+</body>
+</html>
